@@ -135,6 +135,8 @@ def main():
                         patch_file_to_use = "patch_1_v3.diff"
                     else:  
                         patch_file_to_use = "patch_v3.diff"
+                elif major == 10 and minor == 8:
+                    patch_file_to_use = "patch_10.8.168.25.diff"
                 else:
                     patch_file_to_use = "patch_old_v3.diff"
                 log(f"Selected patch file for version {ver}: {patch_file_to_use}")

@@ -69,6 +69,33 @@ jobs:
           python --version
           gclient --version
 
+      - name: Fix Windows SDK path for V8 10.8
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # V8 10.8's setup_toolchain.py expects SDK 10.0.20348.0 but
+          # windows-2022 has a newer version. Find the actual installed SDK
+          # and create a junction so the old path resolves.
+          $sdkBase = "C:\Program Files (x86)\Windows Kits\10"
+          $installed = Get-ChildItem "$sdkBase\Include" -Directory | Where-Object { $_.Name -match '^10\.' } | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $installed) { Write-Output "No SDK found"; exit 1 }
+          $actualVer = $installed.Name
+          Write-Output "Installed SDK: $actualVer"
+          # Check if 10.0.20348.0 already exists
+          $oldPath = "$sdkBase\Include\10.0.20348.0"
+          if (-not (Test-Path $oldPath)) {
+            Write-Output "Creating junction: $oldPath -> $($installed.FullName)"
+            cmd /c mklink /J "$oldPath" "$($installed.FullName)"
+            # Also junction the Lib path
+            $oldLib = "$sdkBase\Lib\10.0.20348.0"
+            $actualLib = "$sdkBase\Lib\$actualVer"
+            if ((Test-Path $actualLib) -and -not (Test-Path $oldLib)) {
+              cmd /c mklink /J "$oldLib" "$actualLib"
+            }
+          } else {
+            Write-Output "10.0.20348.0 already exists"
+          }
+
       - name: Initial sync (V8)
         shell: bash
         run: |
@@ -83,6 +110,7 @@ jobs:
           cp patch_v2.diff v8/
           cp patch_1_v2.diff v8/
           cp patch_old_v2.diff v8/
+          cp patch_10.8.168.25.diff v8/
           cp partition_versions.py v8/ || true
 
       - name: Build d8 with patch
