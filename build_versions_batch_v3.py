@@ -135,7 +135,9 @@ def main():
                         patch_file_to_use = "patch_1_v3.diff"
                     else:  
                         patch_file_to_use = "patch_v3.diff"
-                elif major == 10 and minor == 8:
+                elif major == 11 or (major == 10 and minor == 8):
+                    # V8 11.x / 10.8 predate the Tagged<T> migration (12.x); use the
+                    # bare-object-API patch instead of the Tagged-API patch_old_v3.
                     patch_file_to_use = "patch_10.8.168.25.diff"
                 else:
                     patch_file_to_use = "patch_old_v3.diff"
