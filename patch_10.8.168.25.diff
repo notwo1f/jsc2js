@@ -167,12 +167,14 @@ index ce4d15b2..d44d50f4 100644
    // Script files are often large, thus only print their {Brief} representation.
    os << "\n - script: " << Brief(script());
    os << "\n - function token position: " << function_token_position();
-@@ -1742,6 +1742,10 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+@@ -1742,6 +1742,12 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
      os << "<none>";
    }
    os << "\n";
 +  os << "\nStart BytecodeArray\n";
-+  this->GetActiveBytecodeArray().Disassemble(os);
++  if (this->HasBytecodeArray()) {
++    this->GetActiveBytecodeArray().Disassemble(os);
++  }
 +  os << "\nEnd BytecodeArray\n";
 +  os << std::flush;
  }
