@@ -184,6 +184,24 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
+@@ -1818,4 +1818,17 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
++  // Cap recursion: the patched FixedArray / ObjectBoilerplateDescription /
++  // SharedFunctionInfo expansions below re-enter HeapObjectShortPrint via
++  // Brief(). On a cyclic or deeply-nested constant pool (e.g. an Electron
++  // main-process .jsc) that recursion overflows the native stack (SIGSEGV).
++  static thread_local int s_hosp_depth = 0;
++  struct HospDepthGuard {
++    HospDepthGuard() { ++s_hosp_depth; }
++    ~HospDepthGuard() { --s_hosp_depth; }
++  } hosp_depth_guard;
++  if (s_hosp_depth > 40) {
++    os << AsHex::Address(this->ptr()) << " <max-depth-elided>";
++    return;
++  }
+   PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
+   os << AsHex::Address(this->ptr()) << " ";
+ 
 @@ -1919,14 +1919,24 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
        break;
      case FIXED_ARRAY_TYPE:
