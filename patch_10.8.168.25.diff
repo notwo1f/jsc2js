@@ -158,7 +158,45 @@ diff --git a/src/diagnostics/objects-printer.cc b/src/diagnostics/objects-printe
 index ce4d15b2..d44d50f4 100644
 --- a/src/diagnostics/objects-printer.cc
 +++ b/src/diagnostics/objects-printer.cc
-@@ -1719,7 +1719,7 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+@@ -5,6 +5,10 @@
+ #include <iomanip>
+ #include <memory>
+ 
++#if defined(_WIN32)
++#include <excpt.h>
++#endif
++
+ #include "src/common/globals.h"
+ #include "src/diagnostics/disasm.h"
+ #include "src/diagnostics/disassembler.h"
+@@ -1688,6 +1692,26 @@
+   }
+ }
+ 
++namespace {
++// Leniently-deserialized .jsc files (the JSC-loading d8 patch bypasses the
++// deserializer's integrity checks) can leave wild pointers in a function's
++// constant pool. Disassembling such a function dereferences the garbage and
++// faults. On Windows, wrap the disassembly in a structured-exception handler so
++// an access violation aborts just that one function's bytecode dump instead of
++// killing the whole process, letting the remaining functions disassemble.
++void JscGuardedDisassemble(BytecodeArray bytecode, std::ostream& os) {
++#if defined(_WIN32)
++  __try {
++    bytecode.Disassemble(os);
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++    os << "\n<disassembly aborted: access violation (corrupt constant pool)>\n";
++  }
++#else
++  bytecode.Disassemble(os);
++#endif
++}
++}  // namespace
++
+ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+   PrintHeader(os, "SharedFunctionInfo");
+   os << "\n - name: ";
+@@ -1719,7 +1743,7 @@
    os << "\n - data: " << Brief(function_data(kAcquireLoad));
    os << "\n - code (from data): ";
    os << Brief(GetCode());
@@ -167,12 +205,12 @@ index ce4d15b2..d44d50f4 100644
    // Script files are often large, thus only print their {Brief} representation.
    os << "\n - script: " << Brief(script());
    os << "\n - function token position: " << function_token_position();
-@@ -1742,6 +1742,10 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+@@ -1742,6 +1766,10 @@
      os << "<none>";
    }
    os << "\n";
 +  os << "\nStart BytecodeArray\n";
-+  this->GetActiveBytecodeArray().Disassemble(os);
++  JscGuardedDisassemble(this->GetActiveBytecodeArray(), os);
 +  os << "\nEnd BytecodeArray\n";
 +  os << std::flush;
  }
@@ -182,74 +220,7 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
-@@ -35,6 +35,7 @@
- #include "src/execution/isolate-utils.h"
- #include "src/execution/microtask-queue.h"
- #include "src/execution/protectors-inl.h"
-+#include "src/heap/basic-memory-chunk.h"
- #include "src/heap/factory-inl.h"
- #include "src/heap/heap-inl.h"
- #include "src/heap/local-factory-inl.h"
-@@ -1815,7 +1816,58 @@
- 
- void Smi::SmiPrint(std::ostream& os) const { os << value(); }
- 
-+namespace {
-+// Leniently-deserialized .jsc files (the JSC-loading d8 patch bypasses the
-+// deserializer's integrity checks) can leave wild pointers in constant pools
-+// and object boilerplates. When the disassembler prints such a constant pool
-+// (code.cc's BytecodeArray::Disassemble -> FixedArray::Print -> Brief), it
-+// reaches HeapObjectShortPrint on the wild pointer and segfaults dereferencing
-+// its map. Validate the object lives in committed heap memory first.
-+//
-+// Correctness rests on one fact: if dereferencing an address would fault, that
-+// address is not in any chunk's committed area (area_start..area_end), so the
-+// area-bounds check below returns false and we never dereference it. Reading a
-+// chunk *header* is safe because FromAddress masks a cage-relative pointer down
-+// to the mapped chunk base.
-+//
-+// The main.jsc corruption is specifically an object that is itself readable but
-+// whose *map* pointer is junk, so we must validate the whole obj -> map ->
-+// map's-map chain, not just the object address.
-+bool JscAddrInHeap(Heap* heap, Address addr) {
-+  HeapObject as_obj = HeapObject::FromAddress(addr);
-+  // Regular spaces: Heap::Contains bounds-checks (IsOutsideAllocatedSpace)
-+  // without dereferencing, and per-space checks use committed-area bounds.
-+  if (heap->Contains(as_obj) || heap->SharedHeapContains(as_obj)) return true;
-+  // Otherwise read-only or wild: require the address to fall inside its chunk's
-+  // committed area, so a wild pointer sharing the read-only page is rejected.
-+  BasicMemoryChunk* chunk = BasicMemoryChunk::FromAddress(addr);
-+  return chunk->InReadOnlySpace() && chunk->Contains(addr);
-+}
-+
-+bool JscIsSafelyPrintable(HeapObject obj) {
-+  Isolate* isolate = Isolate::Current();
-+  if (isolate == nullptr) return true;  // no isolate: don't alter behavior
-+  Heap* heap = isolate->heap();
-+  // (1) object must be in committed memory (so reading its map field is safe).
-+  if (!JscAddrInHeap(heap, obj.address())) return false;
-+  // (2) its map must also be a committed object -- a wild map is the actual
-+  //     crash: the object is readable but map()->instance_type() dereferences
-+  //     junk.
-+  PtrComprCageBase cage_base = GetPtrComprCageBase(obj);
-+  Map map = obj.map(cage_base);
-+  if (!JscAddrInHeap(heap, map.address())) return false;
-+  // (3) the map's map must be committed too, cheaply confirming `map` really is
-+  //     a Map rather than arbitrary readable bytes.
-+  if (!JscAddrInHeap(heap, map.map(cage_base).address())) return false;
-+  return true;
-+}
-+}  // namespace
-+
- void HeapObject::HeapObjectShortPrint(std::ostream& os) {
-+  if (!JscIsSafelyPrintable(*this)) {
-+    os << AsHex::Address(this->ptr()) << " <invalid heap object>";
-+    return;
-+  }
-   PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
-   os << AsHex::Address(this->ptr()) << " ";
- 
-@@ -1919,14 +1971,24 @@
+@@ -1919,14 +1919,24 @@
        break;
      case FIXED_ARRAY_TYPE:
        os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
@@ -274,7 +245,7 @@ index c15ac865..167d9a3b 100644
        break;
      case BYTE_ARRAY_TYPE:
        os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
-@@ -2005,6 +2067,9 @@
+@@ -2005,6 +2015,9 @@
        } else {
          os << "<SharedFunctionInfo>";
        }
