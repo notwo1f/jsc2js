@@ -182,104 +182,87 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
-@@ -1815,7 +1815,57 @@
+@@ -35,6 +35,7 @@
+ #include "src/execution/isolate-utils.h"
+ #include "src/execution/microtask-queue.h"
+ #include "src/execution/protectors-inl.h"
++#include "src/heap/basic-memory-chunk.h"
+ #include "src/heap/factory-inl.h"
+ #include "src/heap/heap-inl.h"
+ #include "src/heap/local-factory-inl.h"
+@@ -1815,7 +1816,40 @@
  
  void Smi::SmiPrint(std::ostream& os) const { os << value(); }
  
 +namespace {
-+// JSC-disassembly recursion guard. The patched HeapObjectShortPrint below
-+// recursively expands container objects (FixedArray / ObjectBoilerplateDescription
-+// / SharedFunctionInfo) by calling their full ...Print(), which in turn prints
-+// each element through Brief() -> HeapObjectShortPrint. The V8 object graph is
-+// full of cycles (e.g. SFI -> Script -> shared_function_infos -> SFI), so this
-+// expansion recurses forever and overflows the stack. We break it two ways:
-+//  (1) an on-stack address list: skip expanding an object already being
-+//      expanded higher up the current recursion stack (breaks cycles), and
-+//  (2) a hard depth cap (guards pathologically deep but acyclic structures).
-+// When expansion is suppressed the object still prints its normal one-line brief.
-+// A plain POD array + int is used (rather than std::unordered_set) so the
-+// thread_local state is trivially destructible; V8 builds with
-+// -Werror,-Wexit-time-destructors and would reject a container here.
-+constexpr int kJscShortPrintMaxDepth = 30;
-+thread_local int g_jsc_short_print_depth = 0;
-+thread_local Address g_jsc_short_print_stack[kJscShortPrintMaxDepth];
-+
-+class JscShortPrintScope {
-+ public:
-+  explicit JscShortPrintScope(Address addr) {
-+    if (g_jsc_short_print_depth >= kJscShortPrintMaxDepth) {
-+      expand_ = false;  // depth cap: backstop for deep acyclic structures
-+    } else {
-+      bool on_stack = false;
-+      for (int i = 0; i < g_jsc_short_print_depth; ++i) {
-+        if (g_jsc_short_print_stack[i] == addr) {
-+          on_stack = true;  // cycle: object already being expanded above us
-+          break;
-+        }
-+      }
-+      expand_ = !on_stack;
-+    }
-+    if (expand_) {
-+      g_jsc_short_print_stack[g_jsc_short_print_depth++] = addr;
-+      pushed_ = true;
-+    }
-+  }
-+  ~JscShortPrintScope() {
-+    if (pushed_) --g_jsc_short_print_depth;
-+  }
-+  bool expand() const { return expand_; }
-+
-+ private:
-+  bool expand_ = false;
-+  bool pushed_ = false;
-+};
++// Leniently-deserialized .jsc files (the JSC-loading d8 patch bypasses the
++// deserializer's integrity checks) can leave wild pointers in constant pools
++// and object boilerplates. When the disassembler prints such a constant pool
++// (code.cc's BytecodeArray::Disassemble -> FixedArray::Print -> Brief), it
++// reaches HeapObjectShortPrint on the wild pointer and segfaults dereferencing
++// its map. Validate the object lives in committed heap memory first.
++//
++// Correctness rests on one fact: if dereferencing an address would fault, that
++// address is not in any chunk's committed area (area_start..area_end), so the
++// area-bounds check below returns false and we never dereference it. Reading
++// the chunk *header* is safe here because FromAddress masks a cage-relative
++// pointer down to the mapped chunk base.
++bool JscIsSafelyPrintable(HeapObject obj) {
++  Isolate* isolate = Isolate::Current();
++  if (isolate == nullptr) return true;  // no isolate: don't alter behavior
++  Heap* heap = isolate->heap();
++  // Regular spaces: Heap::Contains bounds-checks (IsOutsideAllocatedSpace)
++  // without dereferencing the object, and per-space checks use committed-area
++  // bounds -- safe on a wild pointer.
++  if (heap->Contains(obj) || heap->SharedHeapContains(obj)) return true;
++  // Otherwise the object is either read-only or wild. Require the address to
++  // fall inside its chunk's committed area, so a wild pointer that merely
++  // shares the read-only chunk's page is rejected instead of dereferenced.
++  BasicMemoryChunk* chunk = BasicMemoryChunk::FromAddress(obj.address());
++  return chunk->InReadOnlySpace() && chunk->Contains(obj.address());
++}
 +}  // namespace
 +
  void HeapObject::HeapObjectShortPrint(std::ostream& os) {
-+  JscShortPrintScope jsc_scope(this->ptr());
++  if (!JscIsSafelyPrintable(*this)) {
++    os << AsHex::Address(this->ptr()) << " <invalid heap object>";
++    return;
++  }
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
  
-@@ -1919,14 +1969,30 @@
+@@ -1919,14 +1953,24 @@
        break;
      case FIXED_ARRAY_TYPE:
        os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
-+      if (jsc_scope.expand()) {
-+        os << "\nStart FixedArray\n";
-+        FixedArray::cast(*this).FixedArrayPrint(os);
-+        os << "\nEnd FixedArray\n";
-+      }
++      os << "\nStart FixedArray\n";
++      FixedArray::cast(*this).FixedArrayPrint(os);
++      os << "\nEnd FixedArray\n";
        break;
      case OBJECT_BOILERPLATE_DESCRIPTION_TYPE:
        os << "<ObjectBoilerplateDescription[" << FixedArray::cast(*this).length()
           << "]>";
-+      if (jsc_scope.expand()) {
-+        os << "\nStart ObjectBoilerplateDescription\n";
-+        ObjectBoilerplateDescription::cast(*this)
-+            .ObjectBoilerplateDescriptionPrint(os);
-+        os << "\nEnd ObjectBoilerplateDescription\n";
-+      }
++      os << "\nStart ObjectBoilerplateDescription\n";
++      ObjectBoilerplateDescription::cast(*this)
++          .ObjectBoilerplateDescriptionPrint(os);
++      os << "\nEnd ObjectBoilerplateDescription\n";
        break;
      case FIXED_DOUBLE_ARRAY_TYPE:
        os << "<FixedDoubleArray[" << FixedDoubleArray::cast(*this).length()
           << "]>";
-+      if (jsc_scope.expand()) {
-+        os << "\nStart FixedDoubleArray\n";
-+        FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
-+        os << "\nEnd FixedDoubleArray\n";
-+      }
++      os << "\nStart FixedDoubleArray\n";
++      FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
++      os << "\nEnd FixedDoubleArray\n";
        break;
      case BYTE_ARRAY_TYPE:
        os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
-@@ -2005,6 +2071,11 @@
+@@ -2005,6 +2049,9 @@
        } else {
          os << "<SharedFunctionInfo>";
        }
-+      if (jsc_scope.expand()) {
-+        os << "\nStart SharedFunctionInfo\n";
-+        shared.SharedFunctionInfoPrint(os);
-+        os << "\nEnd SharedFunctionInfo\n";
-+      }
++      os << "\nStart SharedFunctionInfo\n";
++      shared.SharedFunctionInfoPrint(os);
++      os << "\nEnd SharedFunctionInfo\n";
        break;
      }
      case JS_MESSAGE_OBJECT_TYPE:
