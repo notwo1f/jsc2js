@@ -167,14 +167,12 @@ index ce4d15b2..d44d50f4 100644
    // Script files are often large, thus only print their {Brief} representation.
    os << "\n - script: " << Brief(script());
    os << "\n - function token position: " << function_token_position();
-@@ -1742,6 +1742,12 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
+@@ -1742,6 +1742,10 @@ void SharedFunctionInfo::SharedFunctionInfoPrint(std::ostream& os) {
      os << "<none>";
    }
    os << "\n";
 +  os << "\nStart BytecodeArray\n";
-+  if (this->HasBytecodeArray()) {
-+    this->GetActiveBytecodeArray().Disassemble(os);
-+  }
++  this->GetActiveBytecodeArray().Disassemble(os);
 +  os << "\nEnd BytecodeArray\n";
 +  os << std::flush;
  }
@@ -184,52 +182,99 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
-@@ -35,6 +35,7 @@
- #include "src/execution/isolate-utils.h"
- #include "src/execution/microtask-queue.h"
- #include "src/execution/protectors-inl.h"
-+#include "src/heap/basic-memory-chunk.h"
- #include "src/heap/factory-inl.h"
- #include "src/heap/heap-inl.h"
- #include "src/heap/local-factory-inl.h"
-@@ -1816,8 +1817,30 @@ std::ostream& operator<<(std::ostream& os, const Brief& v) {
+@@ -8,6 +8,7 @@
+ #include <cmath>
+ #include <memory>
+ #include <sstream>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "src/api/api-arguments-inl.h"
+@@ -1815,7 +1816,44 @@
+ 
  void Smi::SmiPrint(std::ostream& os) const { os << value(); }
  
- void HeapObject::HeapObjectShortPrint(std::ostream& os) {
-+  // Cap recursion: the SharedFunctionInfo expansion below re-enters
-+  // HeapObjectShortPrint via Brief(). On a cyclic or deeply-nested constant
-+  // pool (e.g. an Electron main-process .jsc) that recursion could overflow
-+  // the native stack (SIGSEGV).
-+  static thread_local int s_hosp_depth = 0;
-+  struct HospDepthGuard {
-+    HospDepthGuard() { ++s_hosp_depth; }
-+    ~HospDepthGuard() { --s_hosp_depth; }
-+  } hosp_depth_guard;
-+  if (s_hosp_depth > 40) {
-+    os << AsHex::Address(this->ptr()) << " <max-depth-elided>";
-+    return;
++namespace {
++// JSC-disassembly recursion guard. The patched HeapObjectShortPrint below
++// recursively expands container objects (FixedArray / ObjectBoilerplateDescription
++// / SharedFunctionInfo) by calling their full ...Print(), which in turn prints
++// each element through Brief() -> HeapObjectShortPrint. The V8 object graph is
++// full of cycles (e.g. SFI -> Script -> shared_function_infos -> SFI), so this
++// expansion recurses forever and overflows the stack. We break it two ways:
++//  (1) an on-stack set: skip expanding an object already being expanded higher
++//      up the current recursion stack (breaks cycles), and
++//  (2) a hard depth cap (guards pathologically deep but acyclic structures).
++// When expansion is suppressed the object still prints its normal one-line brief.
++thread_local int g_jsc_short_print_depth = 0;
++thread_local std::unordered_set<Address> g_jsc_short_print_active;
++constexpr int kJscShortPrintMaxDepth = 30;
++
++class JscShortPrintScope {
++ public:
++  explicit JscShortPrintScope(Address addr) : addr_(addr) {
++    expand_ = g_jsc_short_print_depth < kJscShortPrintMaxDepth &&
++              g_jsc_short_print_active.insert(addr_).second;
++    if (expand_) ++g_jsc_short_print_depth;
 +  }
++  ~JscShortPrintScope() {
++    if (expand_) {
++      --g_jsc_short_print_depth;
++      g_jsc_short_print_active.erase(addr_);
++    }
++  }
++  bool expand() const { return expand_; }
++
++ private:
++  Address addr_;
++  bool expand_ = false;
++};
++}  // namespace
++
+ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
++  JscShortPrintScope jsc_scope(this->ptr());
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
-+  // Defensive validity check: a desynced .jsc deserialization can leave a
-+  // tagged pointer in the constant pool that lands in reserved-but-uncommitted
-+  // cage memory (or past a space's committed area). Reading its map below would
-+  // SIGSEGV. BasicMemoryChunk::Contains does a precise [area_start, area_end)
-+  // range test against the committed chunk header, so skip such entries.
-+  if (!BasicMemoryChunk::FromHeapObject(*this)->Contains(this->address())) {
-+    os << "<corrupt-heap-ptr>";
-+    return;
-+  }
  
-   if (IsString(cage_base)) {
-     HeapStringAllocator allocator;
-@@ -2005,6 +2028,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+@@ -1919,14 +1957,30 @@
+       break;
+     case FIXED_ARRAY_TYPE:
+       os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
++      if (jsc_scope.expand()) {
++        os << "\nStart FixedArray\n";
++        FixedArray::cast(*this).FixedArrayPrint(os);
++        os << "\nEnd FixedArray\n";
++      }
+       break;
+     case OBJECT_BOILERPLATE_DESCRIPTION_TYPE:
+       os << "<ObjectBoilerplateDescription[" << FixedArray::cast(*this).length()
+          << "]>";
++      if (jsc_scope.expand()) {
++        os << "\nStart ObjectBoilerplateDescription\n";
++        ObjectBoilerplateDescription::cast(*this)
++            .ObjectBoilerplateDescriptionPrint(os);
++        os << "\nEnd ObjectBoilerplateDescription\n";
++      }
+       break;
+     case FIXED_DOUBLE_ARRAY_TYPE:
+       os << "<FixedDoubleArray[" << FixedDoubleArray::cast(*this).length()
+          << "]>";
++      if (jsc_scope.expand()) {
++        os << "\nStart FixedDoubleArray\n";
++        FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
++        os << "\nEnd FixedDoubleArray\n";
++      }
+       break;
+     case BYTE_ARRAY_TYPE:
+       os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
+@@ -2005,6 +2059,11 @@
        } else {
          os << "<SharedFunctionInfo>";
        }
-+      os << "\nStart SharedFunctionInfo\n";
-+      shared.SharedFunctionInfoPrint(os);
-+      os << "\nEnd SharedFunctionInfo\n";
++      if (jsc_scope.expand()) {
++        os << "\nStart SharedFunctionInfo\n";
++        shared.SharedFunctionInfoPrint(os);
++        os << "\nEnd SharedFunctionInfo\n";
++      }
        break;
      }
      case JS_MESSAGE_OBJECT_TYPE:
