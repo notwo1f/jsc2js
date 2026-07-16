@@ -184,12 +184,22 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
-@@ -1818,4 +1818,17 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+@@ -35,6 +35,7 @@
+ #include "src/execution/isolate-utils.h"
+ #include "src/execution/microtask-queue.h"
+ #include "src/execution/protectors-inl.h"
++#include "src/heap/basic-memory-chunk.h"
+ #include "src/heap/factory-inl.h"
+ #include "src/heap/heap-inl.h"
+ #include "src/heap/local-factory-inl.h"
+@@ -1816,8 +1817,30 @@ std::ostream& operator<<(std::ostream& os, const Brief& v) {
+ void Smi::SmiPrint(std::ostream& os) const { os << value(); }
+ 
  void HeapObject::HeapObjectShortPrint(std::ostream& os) {
-+  // Cap recursion: the patched FixedArray / ObjectBoilerplateDescription /
-+  // SharedFunctionInfo expansions below re-enter HeapObjectShortPrint via
-+  // Brief(). On a cyclic or deeply-nested constant pool (e.g. an Electron
-+  // main-process .jsc) that recursion overflows the native stack (SIGSEGV).
++  // Cap recursion: the SharedFunctionInfo expansion below re-enters
++  // HeapObjectShortPrint via Brief(). On a cyclic or deeply-nested constant
++  // pool (e.g. an Electron main-process .jsc) that recursion could overflow
++  // the native stack (SIGSEGV).
 +  static thread_local int s_hosp_depth = 0;
 +  struct HospDepthGuard {
 +    HospDepthGuard() { ++s_hosp_depth; }
@@ -201,8 +211,19 @@ index c15ac865..167d9a3b 100644
 +  }
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
++  // Defensive validity check: a desynced .jsc deserialization can leave a
++  // tagged pointer in the constant pool that lands in reserved-but-uncommitted
++  // cage memory (or past a space's committed area). Reading its map below would
++  // SIGSEGV. BasicMemoryChunk::Contains does a precise [area_start, area_end)
++  // range test against the committed chunk header, so skip such entries.
++  if (!BasicMemoryChunk::FromHeapObject(*this)->Contains(this->address())) {
++    os << "<corrupt-heap-ptr>";
++    return;
++  }
  
-@@ -2005,6 +2015,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
+   if (IsString(cage_base)) {
+     HeapStringAllocator allocator;
+@@ -2005,6 +2028,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
        } else {
          os << "<SharedFunctionInfo>";
        }
