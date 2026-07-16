@@ -182,15 +182,7 @@ diff --git a/src/objects/objects.cc b/src/objects/objects.cc
 index c15ac865..167d9a3b 100644
 --- a/src/objects/objects.cc
 +++ b/src/objects/objects.cc
-@@ -8,6 +8,7 @@
- #include <cmath>
- #include <memory>
- #include <sstream>
-+#include <unordered_set>
- #include <vector>
- 
- #include "src/api/api-arguments-inl.h"
-@@ -1815,7 +1816,44 @@
+@@ -1815,7 +1815,57 @@
  
  void Smi::SmiPrint(std::ostream& os) const { os << value(); }
  
@@ -201,32 +193,45 @@ index c15ac865..167d9a3b 100644
 +// each element through Brief() -> HeapObjectShortPrint. The V8 object graph is
 +// full of cycles (e.g. SFI -> Script -> shared_function_infos -> SFI), so this
 +// expansion recurses forever and overflows the stack. We break it two ways:
-+//  (1) an on-stack set: skip expanding an object already being expanded higher
-+//      up the current recursion stack (breaks cycles), and
++//  (1) an on-stack address list: skip expanding an object already being
++//      expanded higher up the current recursion stack (breaks cycles), and
 +//  (2) a hard depth cap (guards pathologically deep but acyclic structures).
 +// When expansion is suppressed the object still prints its normal one-line brief.
-+thread_local int g_jsc_short_print_depth = 0;
-+thread_local std::unordered_set<Address> g_jsc_short_print_active;
++// A plain POD array + int is used (rather than std::unordered_set) so the
++// thread_local state is trivially destructible; V8 builds with
++// -Werror,-Wexit-time-destructors and would reject a container here.
 +constexpr int kJscShortPrintMaxDepth = 30;
++thread_local int g_jsc_short_print_depth = 0;
++thread_local Address g_jsc_short_print_stack[kJscShortPrintMaxDepth];
 +
 +class JscShortPrintScope {
 + public:
-+  explicit JscShortPrintScope(Address addr) : addr_(addr) {
-+    expand_ = g_jsc_short_print_depth < kJscShortPrintMaxDepth &&
-+              g_jsc_short_print_active.insert(addr_).second;
-+    if (expand_) ++g_jsc_short_print_depth;
++  explicit JscShortPrintScope(Address addr) {
++    if (g_jsc_short_print_depth >= kJscShortPrintMaxDepth) {
++      expand_ = false;  // depth cap: backstop for deep acyclic structures
++    } else {
++      bool on_stack = false;
++      for (int i = 0; i < g_jsc_short_print_depth; ++i) {
++        if (g_jsc_short_print_stack[i] == addr) {
++          on_stack = true;  // cycle: object already being expanded above us
++          break;
++        }
++      }
++      expand_ = !on_stack;
++    }
++    if (expand_) {
++      g_jsc_short_print_stack[g_jsc_short_print_depth++] = addr;
++      pushed_ = true;
++    }
 +  }
 +  ~JscShortPrintScope() {
-+    if (expand_) {
-+      --g_jsc_short_print_depth;
-+      g_jsc_short_print_active.erase(addr_);
-+    }
++    if (pushed_) --g_jsc_short_print_depth;
 +  }
 +  bool expand() const { return expand_; }
 +
 + private:
-+  Address addr_;
 +  bool expand_ = false;
++  bool pushed_ = false;
 +};
 +}  // namespace
 +
@@ -235,7 +240,7 @@ index c15ac865..167d9a3b 100644
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
  
-@@ -1919,14 +1957,30 @@
+@@ -1919,14 +1969,30 @@
        break;
      case FIXED_ARRAY_TYPE:
        os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
@@ -266,7 +271,7 @@ index c15ac865..167d9a3b 100644
        break;
      case BYTE_ARRAY_TYPE:
        os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
-@@ -2005,6 +2059,11 @@
+@@ -2005,6 +2071,11 @@
        } else {
          os << "<SharedFunctionInfo>";
        }
