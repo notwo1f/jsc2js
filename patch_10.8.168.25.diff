@@ -190,7 +190,7 @@ index c15ac865..167d9a3b 100644
  #include "src/heap/factory-inl.h"
  #include "src/heap/heap-inl.h"
  #include "src/heap/local-factory-inl.h"
-@@ -1815,7 +1816,40 @@
+@@ -1815,7 +1816,58 @@
  
  void Smi::SmiPrint(std::ostream& os) const { os << value(); }
  
@@ -204,22 +204,40 @@ index c15ac865..167d9a3b 100644
 +//
 +// Correctness rests on one fact: if dereferencing an address would fault, that
 +// address is not in any chunk's committed area (area_start..area_end), so the
-+// area-bounds check below returns false and we never dereference it. Reading
-+// the chunk *header* is safe here because FromAddress masks a cage-relative
-+// pointer down to the mapped chunk base.
++// area-bounds check below returns false and we never dereference it. Reading a
++// chunk *header* is safe because FromAddress masks a cage-relative pointer down
++// to the mapped chunk base.
++//
++// The main.jsc corruption is specifically an object that is itself readable but
++// whose *map* pointer is junk, so we must validate the whole obj -> map ->
++// map's-map chain, not just the object address.
++bool JscAddrInHeap(Heap* heap, Address addr) {
++  HeapObject as_obj = HeapObject::FromAddress(addr);
++  // Regular spaces: Heap::Contains bounds-checks (IsOutsideAllocatedSpace)
++  // without dereferencing, and per-space checks use committed-area bounds.
++  if (heap->Contains(as_obj) || heap->SharedHeapContains(as_obj)) return true;
++  // Otherwise read-only or wild: require the address to fall inside its chunk's
++  // committed area, so a wild pointer sharing the read-only page is rejected.
++  BasicMemoryChunk* chunk = BasicMemoryChunk::FromAddress(addr);
++  return chunk->InReadOnlySpace() && chunk->Contains(addr);
++}
++
 +bool JscIsSafelyPrintable(HeapObject obj) {
 +  Isolate* isolate = Isolate::Current();
 +  if (isolate == nullptr) return true;  // no isolate: don't alter behavior
 +  Heap* heap = isolate->heap();
-+  // Regular spaces: Heap::Contains bounds-checks (IsOutsideAllocatedSpace)
-+  // without dereferencing the object, and per-space checks use committed-area
-+  // bounds -- safe on a wild pointer.
-+  if (heap->Contains(obj) || heap->SharedHeapContains(obj)) return true;
-+  // Otherwise the object is either read-only or wild. Require the address to
-+  // fall inside its chunk's committed area, so a wild pointer that merely
-+  // shares the read-only chunk's page is rejected instead of dereferenced.
-+  BasicMemoryChunk* chunk = BasicMemoryChunk::FromAddress(obj.address());
-+  return chunk->InReadOnlySpace() && chunk->Contains(obj.address());
++  // (1) object must be in committed memory (so reading its map field is safe).
++  if (!JscAddrInHeap(heap, obj.address())) return false;
++  // (2) its map must also be a committed object -- a wild map is the actual
++  //     crash: the object is readable but map()->instance_type() dereferences
++  //     junk.
++  PtrComprCageBase cage_base = GetPtrComprCageBase(obj);
++  Map map = obj.map(cage_base);
++  if (!JscAddrInHeap(heap, map.address())) return false;
++  // (3) the map's map must be committed too, cheaply confirming `map` really is
++  //     a Map rather than arbitrary readable bytes.
++  if (!JscAddrInHeap(heap, map.map(cage_base).address())) return false;
++  return true;
 +}
 +}  // namespace
 +
@@ -231,7 +249,7 @@ index c15ac865..167d9a3b 100644
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
  
-@@ -1919,14 +1953,24 @@
+@@ -1919,14 +1971,24 @@
        break;
      case FIXED_ARRAY_TYPE:
        os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
@@ -256,7 +274,7 @@ index c15ac865..167d9a3b 100644
        break;
      case BYTE_ARRAY_TYPE:
        os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
-@@ -2005,6 +2049,9 @@
+@@ -2005,6 +2067,9 @@
        } else {
          os << "<SharedFunctionInfo>";
        }
