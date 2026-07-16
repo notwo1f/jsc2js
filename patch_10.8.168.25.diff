@@ -202,31 +202,6 @@ index c15ac865..167d9a3b 100644
    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);
    os << AsHex::Address(this->ptr()) << " ";
  
-@@ -1919,14 +1919,24 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
-       break;
-     case FIXED_ARRAY_TYPE:
-       os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";
-+      os << "\nStart FixedArray\n";
-+      FixedArray::cast(*this).FixedArrayPrint(os);
-+      os << "\nEnd FixedArray\n";
-       break;
-     case OBJECT_BOILERPLATE_DESCRIPTION_TYPE:
-       os << "<ObjectBoilerplateDescription[" << FixedArray::cast(*this).length()
-          << "]>";
-+      os << "\nStart ObjectBoilerplateDescription\n";
-+      ObjectBoilerplateDescription::cast(*this)
-+          .ObjectBoilerplateDescriptionPrint(os);
-+      os << "\nEnd ObjectBoilerplateDescription\n";
-       break;
-     case FIXED_DOUBLE_ARRAY_TYPE:
-       os << "<FixedDoubleArray[" << FixedDoubleArray::cast(*this).length()
-          << "]>";
-+      os << "\nStart FixedDoubleArray\n";
-+      FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
-+      os << "\nEnd FixedDoubleArray\n";
-       break;
-     case BYTE_ARRAY_TYPE:
-       os << "<ByteArray[" << ByteArray::cast(*this).length() << "]>";
 @@ -2005,6 +2015,9 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
        } else {
          os << "<SharedFunctionInfo>";
